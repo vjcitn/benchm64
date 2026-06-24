@@ -6,9 +6,13 @@ scipy.sparse + choice of sklearn or fbpca randomized SVD
 Memory-conservative version for machines with ~60 GB RAM and no swap.
 
 Key design decisions (vs earlier versions):
-  - X.indices stored as int32 (row indices 0..27997): 10.5 GB not 21 GB.
+  - X.indices kept as int64 (as stored in HDF5). Casting to int32 before
+    construction is counterproductive: scipy sees nnz=2.62B > INT32_MAX and
+    silently upcasts back to int64, creating a triple allocation peak of
+    data(10.5) + indices_int64(21) + indices_int32(10.5) + scipy_copy(21)
+    = 63 GB. Passing int64 directly gives a 31.5 GB peak.
   - Two-pass chunked row selection avoids materialising full keep/row_map
-    arrays globally (peak 35 GB numpy during fill).
+    arrays globally (peak ~46 GB numpy during fill).
   - SVD backend selectable via --svd:
       sklearn (default): uses A.T (no-copy view for real sparse matrices).
       fbpca:             uses A.conj().T which copies the full sparse matrix
@@ -109,13 +113,14 @@ print(f"  {n_genes:,} genes x {n_cells:,} cells, {len(data):,} nonzeros "
       f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
 # -- 2. Build CSC matrix ------------------------------------------------------
-# Row indices (0..27997) fit in int32: 10.5 GB vs int64's 21 GB.
+# Pass indices and indptr as-is (both int64 from HDF5).
+# Do NOT cast indices to int32: scipy sees nnz=2.62B > INT32_MAX and silently
+# upcasts back to int64, creating a 63 GB peak (original int64 + int32 temp +
+# scipy's int64 copy). Passing int64 directly peaks at 31.5 GB.
 print("Building CSC matrix ...", flush=True)
 
 X = sp.csc_matrix(
-    (data,
-     indices.astype(np.int32),
-     indptr.astype(np.int64)),
+    (data, indices, indptr),
     shape=(n_genes, n_cells)
 )
 del data, indices, indptr
@@ -163,6 +168,9 @@ top_genes = np.argsort(variance)[::-1][:N_HVG]
 genes_hvg = genes[top_genes]
 
 # -- 4b. Two-pass chunked row selection from CSC ------------------------------
+# X.indices is int64 (21 GB). new_indices is int32 (6.9 GB) since output row
+# indices are 0..N_HVG-1, which fits in int32.
+# Peak: X (31.5 GB) + new_data (6.9 GB) + new_indices (6.9 GB) + ~0.5 GB = 46 GB.
 CHUNK_COLS = 50_000
 
 row_map = np.full(n_genes, -1, dtype=np.int32)
